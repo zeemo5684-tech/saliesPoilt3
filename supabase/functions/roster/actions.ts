@@ -20,7 +20,7 @@ import {
 } from "./rules.ts";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const ALLOWED_WHILE_PASSWORD_CHANGE = new Set(["me", "passwordChanged"]);
+const ALLOWED_WHILE_PASSWORD_CHANGE = new Set(["me", "passwordChanged", "profile", "listNotifications", "markNotificationRead", "markAllNotificationsRead", "deleteNotification"]);
 
 export function placementOf(row: MemberRow): Placement {
   return { role: row.role, companyId: row.company_id, branchId: row.branch_id, teamId: row.team_id };
@@ -110,6 +110,22 @@ export async function performAction(actor: MemberRow, body: Record<string, unkno
       return markAllNotificationsRead(actor);
     case "deleteNotification":
       return deleteNotification(actor, body);
+    case "listTasks":
+      return listTasks(actor, body);
+    case "importTasks":
+      return importTasks(actor, body);
+    case "createTask":
+      return createTask(actor, body);
+    case "updateTaskStatus":
+      return updateTaskStatus(actor, body);
+    case "toggleCompanyStatus":
+      return toggleCompanyStatus(actor, body);
+    case "listCompanyAdmins":
+      return listCompanyAdmins(actor);
+    case "toggleAdminStatus":
+      return toggleAdminStatus(actor, body);
+    case "listCompanies":
+      return listCompanies(actor);
     default:
       throw new HttpError(400, "unknown_action");
   }
@@ -184,7 +200,7 @@ function scopedMembersQuery(actor: MemberRow) {
     .select(MEMBER_SELECT)
     .order("roster_order", { ascending: true, nullsFirst: false })
     .order("full_name_en");
-  if (isPlatformRole(actor.role)) return query;
+  if (isPlatformRole(actor.role)) return query.eq("id", actor.id);
   if (actor.role === "COMPANY_ADMIN" && actor.company_id) return query.eq("company_id", actor.company_id);
   if (actor.role === "BRANCH_MANAGER" && actor.branch_id) return query.eq("branch_id", actor.branch_id);
   if (actor.company_id && (hasCustomPermission(actor, "employee.view") || hasCustomPermission(actor, "employee.import") || hasCustomPermission(actor, "employee.transfer"))) {
@@ -226,9 +242,9 @@ async function listMembers(actor: MemberRow) {
 
 async function loadLookups(actor: MemberRow) {
   const empty = { companies: [], branches: [], teams: [] };
+  if (isPlatformRole(actor.role)) return empty;
   if (actor.role === "EMPLOYEE" && !hasCustomPermission(actor, "employee.view") && !hasCustomPermission(actor, "employee.import")) return empty;
-  const platform = isPlatformRole(actor.role);
-  if (!platform && !actor.company_id) return empty;
+  if (!actor.company_id) return empty;
   if (actor.role === "EMPLOYEE" && actor.company_id) {
     const { data: companyData, error: companyError } = await db.from("companies").select("id, name, trade_license").eq("id", actor.company_id);
     if (companyError) throw companyError;
@@ -395,11 +411,17 @@ async function createCompanyWithAdmin(actor: MemberRow, body: Record<string, unk
     company_id: companyData.id,
     status: "Active",
     must_change_password: true,
-    temp_password: adminPassword,
   });
   if (memberError) {
     await db.from("companies").delete().eq("id", companyData.id);
     throw memberError;
+  }
+
+  try {
+    const { provisionFirebaseAccount } = await import("./firebaseAdmin.ts");
+    await provisionFirebaseAccount(adminEmail, adminPassword);
+  } catch (e) {
+    console.error("Failed to provision Firebase account for admin:", e);
   }
 
   return { company: companyData, admin: { email: adminEmail, userId: nextUserId } };
@@ -422,7 +444,7 @@ async function updateProfile(actor: MemberRow, body: Record<string, unknown>) {
 async function finishPasswordChange(actor: MemberRow) {
   const { error } = await db
     .from("members")
-    .update({ must_change_password: false, temp_password: null, updated_at: new Date().toISOString() })
+    .update({ must_change_password: false, updated_at: new Date().toISOString() })
     .eq("id", actor.id);
   if (error) throw error;
   return { ok: true };
@@ -441,10 +463,16 @@ async function resetMemberPassword(actor: MemberRow, body: Record<string, unknow
   const newPassword = requireString(body.newPassword, "password");
   if (newPassword.length < 8) throw new HttpError(422, "password_too_short");
 
+  try {
+    const { updateFirebasePassword } = await import("./firebaseAdmin.ts");
+    await updateFirebasePassword(target.email, newPassword);
+  } catch (e) {
+    console.error("Failed to update Firebase password:", e);
+    throw new HttpError(500, "password_update_failed");
+  }
   const { error } = await db
     .from("members")
     .update({
-      temp_password: newPassword,
       must_change_password: true,
       updated_at: new Date().toISOString(),
     })
@@ -696,9 +724,14 @@ async function addCompanyAssistant(actor: MemberRow, body: Record<string, unknow
     is_assistant: true,
     status: "Active",
     must_change_password: true,
-    temp_password: password,
   });
   if (error) throw error;
+  try {
+    const { provisionFirebaseAccount } = await import("./firebaseAdmin.ts");
+    await provisionFirebaseAccount(email, password);
+  } catch (e) {
+    console.error("Failed to provision Firebase account for assistant:", e);
+  }
   return { assistant: { email, userId: nextUserId } };
 }
 
@@ -791,16 +824,21 @@ async function createPasswordRequest(actor: MemberRow, body: Record<string, unkn
 
 async function checkPasswordRequest(actor: MemberRow, body: Record<string, unknown>) {
   const fingerprint = optionalString(body.browserFingerprint);
-  if (!fingerprint) return { pending: false };
-  const { data, error } = await db
+  if (!fingerprint) return { pending: false, approved: false };
+  const { data: pendingReq, error } = await db
     .from("password_change_requests")
     .select("id, status, requested_at")
     .eq("member_id", actor.id)
-    .eq("status", "pending")
+    .in("status", ["pending", "approved"])
     .eq("browser_fingerprint", fingerprint)
+    .order("requested_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) throw error;
-  return { pending: Boolean(data), requestedAt: data?.requested_at ?? null };
+  if (!pendingReq) return { pending: false, approved: false };
+  if (pendingReq.status === "pending") return { pending: true, approved: false, requestedAt: pendingReq.requested_at };
+  if (pendingReq.status === "approved") return { pending: false, approved: true, requestedAt: pendingReq.requested_at };
+  return { pending: false, approved: false };
 }
 
 async function reviewPasswordRequest(actor: MemberRow, body: Record<string, unknown>) {
@@ -831,9 +869,15 @@ async function reviewPasswordRequest(actor: MemberRow, body: Record<string, unkn
     dedupeKey: `password-request:${id}:${decision}`,
   });
   if (decision === "approved") {
+    const resetToken = generateResetToken();
+    const tokenHash = await sha256Hex(resetToken);
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await db.from("password_change_requests").update({
+      reset_token_hash: tokenHash,
+      expires_at: expiresAt,
+    }).eq("id", id);
     await db.from("members").update({
       must_change_password: true,
-      temp_password: null,
       updated_at: new Date().toISOString(),
     }).eq("id", (req as { member_id: string }).member_id);
   }
@@ -843,17 +887,283 @@ async function reviewPasswordRequest(actor: MemberRow, body: Record<string, unkn
 export async function checkPasswordRequestByEmail(body: Record<string, unknown>) {
   const email = requireString(body.email, "email").toLowerCase();
   const fingerprint = optionalString(body.browserFingerprint);
-  if (!fingerprint) return { pending: false };
+  if (!fingerprint) return { pending: false, approved: false };
   const { data: member, error: mError } = await db.from("members").select("id").eq("email", email).maybeSingle();
   if (mError) throw mError;
-  if (!member) return { pending: false };
+  if (!member) return { pending: false, approved: false };
   const { data, error } = await db
     .from("password_change_requests")
-    .select("id, status, requested_at")
+    .select("id, status, requested_at, expires_at, used_at, reset_token_hash")
     .eq("member_id", member.id)
-    .eq("status", "pending")
+    .in("status", ["pending", "approved"])
     .eq("browser_fingerprint", fingerprint)
+    .order("requested_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) throw error;
-  return { pending: Boolean(data), requestedAt: data?.requested_at ?? null };
+  if (!data) return { pending: false, approved: false };
+  if (data.status === "pending") return { pending: true, approved: false, requestedAt: data.requested_at };
+  if (data.status === "approved") {
+    const expired = data.expires_at && new Date(data.expires_at) < new Date();
+    const used = data.used_at !== null;
+    if (expired || used) return { pending: false, approved: false };
+    return { pending: false, approved: true, requestedAt: data.requested_at };
+  }
+  return { pending: false, approved: false };
+}
+
+export async function changePasswordWithToken(body: Record<string, unknown>) {
+  const email = requireString(body.email, "email").toLowerCase();
+  const fingerprint = requireString(body.browserFingerprint, "browser_fingerprint");
+  const newPassword = requireString(body.newPassword, "password");
+  if (newPassword.length < 8) throw new HttpError(422, "password_too_short");
+  const { data: member, error: mError } = await db.from("members").select("id, email").eq("email", email).maybeSingle();
+  if (mError) throw mError;
+  if (!member) throw new HttpError(404, "not_found");
+  const { data: req, error: rError } = await db
+    .from("password_change_requests")
+    .select("id, status, reset_token_hash, expires_at, used_at")
+    .eq("member_id", member.id)
+    .eq("status", "approved")
+    .eq("browser_fingerprint", fingerprint)
+    .is("used_at", null)
+    .order("requested_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (rError) throw rError;
+  if (!req || !req.reset_token_hash) throw new HttpError(403, "no_approved_request");
+  if (req.expires_at && new Date(req.expires_at) < new Date()) throw new HttpError(403, "token_expired");
+  try {
+    const { updateFirebasePassword } = await import("./firebaseAdmin.ts");
+    await updateFirebasePassword(member.email, newPassword);
+  } catch (e) {
+    console.error("Failed to update Firebase password:", e);
+    throw new HttpError(500, "password_update_failed");
+  }
+  const { error: markUsedError } = await db.from("password_change_requests").update({
+    used_at: new Date().toISOString(),
+  }).eq("id", req.id);
+  if (markUsedError) throw markUsedError;
+  const { error: clearMustChange } = await db.from("members").update({
+    must_change_password: false,
+    updated_at: new Date().toISOString(),
+  }).eq("id", member.id);
+  if (clearMustChange) throw clearMustChange;
+  return { ok: true };
+}
+
+// ── Tasks ──────────────────────────────────────────────────────
+
+const MAX_TASK_ROWS = 500;
+const TASK_PRIORITIES = ["low", "medium", "high", "urgent"] as const;
+const TASK_STATUSES = ["pending", "in_progress", "completed", "cancelled"] as const;
+
+async function listTasks(actor: MemberRow, body: Record<string, unknown>) {
+  if (isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  let query = db
+    .from("tasks")
+    .select("id, title, description, assigned_to, due_date, priority, status, import_batch_id, created_at, created_by, members!tasks_assigned_to_fkey(full_name_en, email, user_id)")
+    .order("created_at", { ascending: false });
+  if (actor.role === "COMPANY_ADMIN" && actor.company_id) {
+    query = query.eq("company_id", actor.company_id);
+  } else if (actor.role === "BRANCH_MANAGER" && actor.branch_id) {
+    query = query.or(`branch_id.eq.${actor.branch_id},assigned_to.eq.${actor.id}`);
+  } else {
+    query = query.eq("assigned_to", actor.id);
+  }
+  const statusFilter = optionalString(body.status);
+  if (statusFilter && TASK_STATUSES.includes(statusFilter as (typeof TASK_STATUSES)[number])) {
+    query = query.eq("status", statusFilter);
+  }
+  const { data, error } = await query;
+  if (error) throw error;
+  return { tasks: data ?? [] };
+}
+
+async function importTasks(actor: MemberRow, body: Record<string, unknown>) {
+  if (isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  if (!actor.company_id) throw new HttpError(403, "forbidden");
+  if (!Array.isArray(body.rows) || body.rows.length === 0 || body.rows.length > MAX_TASK_ROWS) {
+    throw new HttpError(422, "invalid_rows");
+  }
+  const commit = body.commit === true;
+  const batchId = crypto.randomUUID();
+  const issues: { line: number; code: string }[] = [];
+  const parsed: { line: number; title: string; description: string | null; assignedEmail: string; dueDate: string | null; priority: string; branchId: string | null }[] = [];
+  for (let i = 0; i < body.rows.length; i++) {
+    const r = (typeof body.rows[i] === "object" && body.rows[i] !== null ? body.rows[i] : {}) as Record<string, unknown>;
+    const line = typeof r.line === "number" ? r.line : i + 1;
+    const title = requireString(r.title, "title");
+    const description = optionalString(r.description);
+    const assignedEmail = requireString(r.assignedEmail, "assigned_email").toLowerCase();
+    if (!EMAIL_PATTERN.test(assignedEmail)) { issues.push({ line, code: "invalid_email" }); continue; }
+    const dueDate = optionalString(r.dueDate);
+    const priority = optionalString(r.priority) ?? "medium";
+    if (!TASK_PRIORITIES.includes(priority as (typeof TASK_PRIORITIES)[number])) { issues.push({ line, code: "invalid_priority" }); continue; }
+    const branchId = optionalUuid(r.branchId, "branch");
+    parsed.push({ line, title, description, assignedEmail, dueDate, priority, branchId });
+  }
+  if (issues.length > 0) throw new HttpError(422, "validation", issues);
+  const { data: assignees, error: aError } = await db.from("members").select("id, email").eq("company_id", actor.company_id).in("email", parsed.map((p) => p.assignedEmail));
+  if (aError) throw aError;
+  const emailToId = new Map((assignees ?? []).map((m: { id: string; email: string }) => [m.email.toLowerCase(), m.id]));
+  const missing: { line: number; code: string }[] = [];
+  for (const p of parsed) {
+    if (!emailToId.has(p.assignedEmail)) missing.push({ line: p.line, code: "assignee_not_found" });
+  }
+  if (missing.length > 0) throw new HttpError(422, "validation", missing);
+  if (!commit) return { valid: true, count: parsed.length };
+  const rows = parsed.map((p) => ({
+    company_id: actor.company_id,
+    branch_id: p.branchId,
+    title: p.title,
+    description: p.description,
+    assigned_to: emailToId.get(p.assignedEmail) as string,
+    due_date: p.dueDate,
+    priority: p.priority,
+    status: "pending",
+    import_batch_id: batchId,
+    created_by: actor.id,
+  }));
+  const { error: insError } = await db.from("tasks").insert(rows);
+  if (insError) throw insError;
+  const recipientIds = Array.from(new Set(rows.map((r) => r.assigned_to)));
+  await notifyMembers(recipientIds, {
+    type: "task_assigned",
+    title: `${parsed.length} task(s) assigned`,
+    body: parsed[0]?.title ?? "",
+    linkPath: "/tasks",
+    dedupeKey: `task-import:${batchId}`,
+  });
+  return { valid: true, created: parsed.length, batchId };
+}
+
+async function updateTaskStatus(actor: MemberRow, body: Record<string, unknown>) {
+  if (isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  const id = optionalUuid(body.id, "id");
+  if (!id) throw new HttpError(422, "invalid_id");
+  const newStatus = requireString(body.status, "status");
+  if (!TASK_STATUSES.includes(newStatus as (typeof TASK_STATUSES)[number])) throw new HttpError(422, "invalid_status");
+  const { data: task, error: tError } = await db.from("tasks").select("id, assigned_to, company_id, branch_id, status").eq("id", id).maybeSingle();
+  if (tError) throw tError;
+  if (!task) throw new HttpError(404, "not_found");
+  const canAccess = task.assigned_to === actor.id ||
+    (actor.role === "COMPANY_ADMIN" && task.company_id === actor.company_id) ||
+    (actor.role === "BRANCH_MANAGER" && task.branch_id === actor.branch_id);
+  if (!canAccess) throw new HttpError(403, "forbidden");
+  const previousStatus = task.status;
+  const { error: uError } = await db.from("tasks").update({ status: newStatus, updated_at: new Date().toISOString() }).eq("id", id);
+  if (uError) throw uError;
+  await db.from("task_status_history").insert({
+    task_id: id,
+    previous_status: previousStatus,
+    new_status: newStatus,
+    changed_by: actor.id,
+  });
+  return { ok: true };
+}
+
+async function createTask(actor: MemberRow, body: Record<string, unknown>) {
+  if (isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  if (!actor.company_id) throw new HttpError(403, "forbidden");
+  const title = requireString(body.title, "title");
+  const description = optionalString(body.description);
+  const assignedTo = optionalUuid(body.assignedTo, "assignee");
+  const dueDate = optionalString(body.dueDate);
+  const priority = optionalString(body.priority) ?? "medium";
+  if (!TASK_PRIORITIES.includes(priority as (typeof TASK_PRIORITIES)[number])) throw new HttpError(422, "invalid_priority");
+  const branchId = optionalUuid(body.branchId, "branch");
+  if (assignedTo) {
+    const { data: assignee, error } = await db.from("members").select("id, company_id").eq("id", assignedTo).maybeSingle();
+    if (error) throw error;
+    if (!assignee || assignee.company_id !== actor.company_id) throw new HttpError(422, "assignee_not_in_company");
+  }
+  const { data: task, error } = await db.from("tasks").insert({
+    company_id: actor.company_id,
+    branch_id: branchId,
+    title,
+    description,
+    assigned_to: assignedTo,
+    due_date: dueDate,
+    priority,
+    status: "pending",
+    created_by: actor.id,
+  }).select("id").maybeSingle();
+  if (error) throw error;
+  if (!task) throw new HttpError(422, "invalid_task");
+  if (assignedTo) {
+    await notifyMembers([assignedTo], {
+      type: "task_assigned",
+      title,
+      body: description,
+      linkPath: "/tasks",
+      dedupeKey: `task:${task.id}:assigned`,
+    });
+  }
+  return { taskId: task.id };
+}
+
+// ── Company Management ─────────────────────────────────────────
+
+async function toggleCompanyStatus(actor: MemberRow, body: Record<string, unknown>) {
+  if (!isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  const id = optionalUuid(body.id, "id");
+  if (!id) throw new HttpError(422, "invalid_id");
+  const newStatus = requireString(body.status, "status");
+  if (newStatus !== "active" && newStatus !== "suspended") throw new HttpError(422, "invalid_status");
+  const { error } = await db.from("companies").update({ status: newStatus, updated_at: new Date().toISOString() }).eq("id", id);
+  if (error) throw error;
+  if (newStatus === "suspended") {
+    const { data: members } = await db.from("members").select("id").eq("company_id", id);
+    if (members && members.length > 0) {
+      await db.from("members").update({ status: "Suspended", updated_at: new Date().toISOString() }).eq("company_id", id);
+    }
+  }
+  return { ok: true };
+}
+
+async function listCompanyAdmins(actor: MemberRow) {
+  if (!isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  const { data, error } = await db
+    .from("members")
+    .select("id, email, full_name_en, full_name_ar, user_id, role, status, company_id, companies(id, name, status)")
+    .eq("role", "COMPANY_ADMIN")
+    .order("full_name_en");
+  if (error) throw error;
+  return { admins: data ?? [] };
+}
+
+async function toggleAdminStatus(actor: MemberRow, body: Record<string, unknown>) {
+  if (!isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  const id = optionalUuid(body.id, "id");
+  if (!id) throw new HttpError(422, "invalid_id");
+  const newStatus = requireString(body.status, "status");
+  if (newStatus !== "Active" && newStatus !== "Suspended") throw new HttpError(422, "invalid_status");
+  const { error } = await db.from("members").update({ status: newStatus, updated_at: new Date().toISOString() }).eq("id", id).eq("role", "COMPANY_ADMIN");
+  if (error) throw error;
+  return { ok: true };
+}
+
+async function listCompanies(actor: MemberRow) {
+  if (!isPlatformRole(actor.role)) throw new HttpError(403, "forbidden");
+  const { data, error } = await db
+    .from("companies")
+    .select("id, name, trade_license, status, created_at")
+    .order("name");
+  if (error) throw error;
+  return { companies: data ?? [] };
+}
+
+// ── Secure Token Utilities ─────────────────────────────────────
+
+function generateResetToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const data = new TextEncoder().encode(text);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }

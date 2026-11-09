@@ -19,9 +19,10 @@ export function ProfilePage() {
   const [fullNameEn, setFullNameEn] = useState('');
   const [fullNameAr, setFullNameAr] = useState('');
   const [phone, setPhone] = useState('');
-  const [status, setStatus] = useState<'idle' | 'saved' | 'resetSent' | 'requestSent' | 'pending' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'saved' | 'resetSent' | 'requestSent' | 'pending' | 'approved' | 'error'>('idle');
   const [saving, setSaving] = useState(false);
   const [hasPending, setHasPending] = useState(false);
+  const [hasApproved, setHasApproved] = useState(false);
 
   useEffect(() => {
     if (!member) return;
@@ -36,8 +37,11 @@ export function ProfilePage() {
     let cancelled = false;
     void (async () => {
       try {
-        const { pending } = await checkPasswordRequest(fp);
-        if (!cancelled) setHasPending(pending);
+        const { pending, approved } = await checkPasswordRequest(fp);
+        if (!cancelled) {
+          setHasPending(pending);
+          setHasApproved(approved);
+        }
       } catch {
         // ignore — user can still use email option
       }
@@ -123,6 +127,11 @@ export function ProfilePage() {
           {hasPending && (
             <p role="status" className="mt-4 rounded-lg bg-warning-50 px-3 py-3 text-sm text-warning-700">
               {t('profile.pendingRequest')}
+            </p>
+          )}
+          {hasApproved && (
+            <p role="status" className="mt-4 rounded-lg bg-success-50 px-3 py-3 text-sm text-success-700">
+              {t('profile.approvedRequest')}
             </p>
           )}
           {status === 'resetSent' && <p role="status" className="mt-4 rounded-lg bg-success-50 px-3 py-2 text-sm text-success-700">{t('profile.resetSent')}</p>}

@@ -170,7 +170,8 @@
     "requestReset": "Request approval to change password",
     "resetSent": "A password-change link was sent to your email.",
     "requestSent": "Your request was sent to an authorized owner.",
-    "pendingRequest": "Your password reset request is pending and waiting for an administrator's approval."
+    "pendingRequest": "Your password reset request is pending and waiting for an administrator's approval.",
+    "approvedRequest": "Your password reset was approved. Use the forgot password page to set your new password."
   },
   "organization": {
     "branches": "branches",
@@ -236,7 +237,9 @@
       "generic": "Could not update your password. Please try again.",
       "accountExists": "This email already signs in with a password. Use the email and password form instead.",
       "unauthorizedDomain": "Google sign-in is not enabled for this website yet. Ask the app owner to add it in the sign-in settings.",
-      "popupBlocked": "Your browser blocked the Google window. Allow pop-ups for this site and try again."
+      "popupBlocked": "Your browser blocked the Google window. Allow pop-ups for this site and try again.",
+      "tokenExpired": "Your approved reset has expired. Please request a new one.",
+      "noApprovedRequest": "No approved password reset found. Please request approval first."
     },
     "changePassword": {
       "title": "Choose a new password",
@@ -285,6 +288,7 @@
       "requestApproval": "Request approval from an owner",
       "requested": "Your request was sent to the platform or company owner.",
       "pending": "Your password reset request is pending and waiting for an administrator's approval.",
+      "approved": "Your password reset was approved. Set your new password below.",
       "back": "Back to sign in"
     },
     "signOut": "Sign out"

@@ -1,5 +1,5 @@
 import { createRemoteJWKSet, jwtVerify } from "npm:jose@5";
-import { performAction, requestPasswordByEmail, checkPasswordRequestByEmail } from "./actions.ts";
+import { performAction, requestPasswordByEmail, checkPasswordRequestByEmail, changePasswordWithToken } from "./actions.ts";
 import { db, MEMBER_SELECT, type MemberRow } from "./db.ts";
 import { corsHeaders, HttpError, json } from "./http.ts";
 
@@ -79,6 +79,9 @@ Deno.serve(async (req: Request) => {
     }
     if (body.action === "checkPasswordRequestByEmail") {
       return json(await checkPasswordRequestByEmail(body));
+    }
+    if (body.action === "changePasswordWithToken") {
+      return json(await changePasswordWithToken(body));
     }
     const token = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
     if (!token) throw new HttpError(401, "unauthenticated");

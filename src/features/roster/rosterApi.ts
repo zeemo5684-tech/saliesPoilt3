@@ -293,8 +293,8 @@ export async function createPasswordRequest(browserFingerprint: string): Promise
   await callRoster<{ ok: true }>({ action: 'createPasswordRequest', browserFingerprint });
 }
 
-export async function checkPasswordRequest(browserFingerprint: string): Promise<{ pending: boolean; requestedAt: string | null }> {
-  return callRoster<{ pending: boolean; requestedAt: string | null }>({ action: 'checkPasswordRequest', browserFingerprint });
+export async function checkPasswordRequest(browserFingerprint: string): Promise<{ pending: boolean; approved: boolean; requestedAt: string | null }> {
+  return callRoster<{ pending: boolean; approved: boolean; requestedAt: string | null }>({ action: 'checkPasswordRequest', browserFingerprint });
 }
 
 export async function createPasswordRequestByEmail(email: string, browserFingerprint: string): Promise<void> {
@@ -306,7 +306,7 @@ export async function createPasswordRequestByEmail(email: string, browserFingerp
   if (!response.ok) throw new RosterError(response.status, 'request_failed');
 }
 
-export async function checkPasswordRequestByEmail(email: string, browserFingerprint: string): Promise<{ pending: boolean; requestedAt: string | null }> {
+export async function checkPasswordRequestByEmail(email: string, browserFingerprint: string): Promise<{ pending: boolean; approved: boolean; requestedAt: string | null }> {
   const response = await fetch(ROSTER_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -315,7 +315,20 @@ export async function checkPasswordRequestByEmail(email: string, browserFingerpr
   if (!response.ok) throw new RosterError(response.status, 'request_failed');
   const payload = await response.json().catch(() => null);
   if (typeof payload !== 'object' || payload === null) throw new RosterError(response.status, 'invalid_response');
-  return payload as { pending: boolean; requestedAt: string | null };
+  return payload as { pending: boolean; approved: boolean; requestedAt: string | null };
+}
+
+export async function changePasswordWithToken(email: string, browserFingerprint: string, newPassword: string): Promise<void> {
+  const response = await fetch(ROSTER_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'changePasswordWithToken', email, browserFingerprint, newPassword }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    const code = typeof payload === 'object' && payload !== null && 'error' in payload && typeof (payload as { error: unknown }).error === 'string' ? (payload as { error: string }).error : 'request_failed';
+    throw new RosterError(response.status, code);
+  }
 }
 
 export async function addCompanyAssistant(input: {
@@ -369,4 +382,89 @@ export async function markAllNotificationsRead(): Promise<void> {
 
 export async function deleteNotification(id: string): Promise<void> {
   await callRoster<{ ok: true }>({ action: 'deleteNotification', id });
+}
+
+// ── Tasks ─────────────────────────────────────────────────────
+export interface TaskRow {
+  id: string;
+  title: string;
+  description: string | null;
+  assigned_to: string | null;
+  due_date: string | null;
+  priority: 'low' | 'medium' | 'high' | 'urgent';
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+  import_batch_id: string | null;
+  created_at: string;
+  created_by: string;
+  members: { full_name_en: string; email: string; user_id: string } | null;
+}
+
+export interface TaskImportRow {
+  line: number;
+  title: string;
+  description?: string | null;
+  assignedEmail: string;
+  dueDate?: string | null;
+  priority?: string;
+  branchId?: string | null;
+}
+
+export async function fetchTasks(status?: string): Promise<{ tasks: TaskRow[] }> {
+  return callRoster<{ tasks: TaskRow[] }>({ action: 'listTasks', status: status ?? null });
+}
+
+export async function importTasks(rows: TaskImportRow[], commit: boolean): Promise<{ valid: boolean; count?: number; created?: number; batchId?: string }> {
+  return callRoster<{ valid: boolean; count?: number; created?: number; batchId?: string }>({ action: 'importTasks', rows, commit });
+}
+
+export async function createTask(input: {
+  title: string;
+  description?: string | null;
+  assignedTo?: string | null;
+  dueDate?: string | null;
+  priority?: string;
+  branchId?: string | null;
+}): Promise<{ taskId: string }> {
+  return callRoster<{ taskId: string }>({ action: 'createTask', ...input });
+}
+
+export async function updateTaskStatus(id: string, status: string): Promise<void> {
+  await callRoster<{ ok: true }>({ action: 'updateTaskStatus', id, status });
+}
+
+// ── Company Management ────────────────────────────────────────
+export interface CompanyWithStatus {
+  id: string;
+  name: string;
+  trade_license: string | null;
+  status: string;
+  created_at: string;
+}
+
+export async function listCompanies(): Promise<{ companies: CompanyWithStatus[] }> {
+  return callRoster<{ companies: CompanyWithStatus[] }>({ action: 'listCompanies' });
+}
+
+export async function toggleCompanyStatus(id: string, status: 'active' | 'suspended'): Promise<void> {
+  await callRoster<{ ok: true }>({ action: 'toggleCompanyStatus', id, status });
+}
+
+export interface CompanyAdmin {
+  id: string;
+  email: string;
+  full_name_en: string;
+  full_name_ar: string | null;
+  user_id: string;
+  role: string;
+  status: RosterStatus;
+  company_id: string | null;
+  companies: { id: string; name: string; status: string } | null;
+}
+
+export async function listCompanyAdmins(): Promise<{ admins: CompanyAdmin[] }> {
+  return callRoster<{ admins: CompanyAdmin[] }>({ action: 'listCompanyAdmins' });
+}
+
+export async function toggleAdminStatus(id: string, status: RosterStatus): Promise<void> {
+  await callRoster<{ ok: true }>({ action: 'toggleAdminStatus', id, status });
 }
